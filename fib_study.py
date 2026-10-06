@@ -22,7 +22,8 @@ Yaptıkları:
   5. --sweep: M ve W için ZigZag parametre taraması (sağlamlık kontrolü)
 
 Kullanım:
-  pip install yfinance pandas numpy matplotlib lxml
+  pip install -r requirements.txt
+  streamlit run streamlit_app.py            # arayüz
   python fib_study.py                       # tickers.txt yoksa S&P 500 (Wikipedia)
   python fib_study.py --tickers tickers.txt --tf M,W
   python fib_study.py --sweep --tf M,W
@@ -59,13 +60,56 @@ TF_ORDER = ['M', '2W', 'W', '3D', 'D']
 
 
 # ----------------------------------------------------------------------------- veri
+SP500_CSV = ('https://raw.githubusercontent.com/datasets/s-and-p-500-companies/'
+             'main/data/constituents.csv')
+
+
+def sp500_tickers():
+    """S&P 500 listesi (bugünkü üyeler -> survivorship bias). lxml gerektirmez."""
+    tbl = pd.read_csv(SP500_CSV)
+    return [str(s).replace('.', '-').strip() for s in tbl['Symbol'].tolist()]
+
+
 def load_universe(path):
     if path and os.path.exists(path):
         with open(path) as f:
             return [t.strip().upper() for t in f if t.strip() and not t.startswith('#')]
-    print('tickers dosyası yok -> S&P 500 (Wikipedia, bugünkü üyeler, survivorship bias!)')
-    tbl = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
-    return [s.replace('.', '-') for s in tbl['Symbol'].tolist()]
+    print('tickers dosyası yok -> S&P 500 (bugünkü üyeler, survivorship bias!)')
+    return sp500_tickers()
+
+
+def _clean(df):
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    if not all(c in df.columns for c in cols):
+        return None
+    df = df[cols].dropna()
+    df.index = pd.DatetimeIndex(df.index).tz_localize(None)
+    return df if len(df) > 300 else None
+
+
+def fetch_many(tickers, chunk=100, progress=None):
+    """Toplu indirme (cache'siz). {ticker: df} döner."""
+    import yfinance as yf
+    out = {}
+    for s in range(0, len(tickers), chunk):
+        part = tickers[s:s + chunk]
+        raw = yf.download(part, period='max', interval='1d', auto_adjust=True,
+                          group_by='ticker', threads=True, progress=False)
+        for tk in part:
+            try:
+                df = raw[tk] if len(part) > 1 else raw
+                df = _clean(df.copy())
+                if df is not None:
+                    out[tk] = df
+            except (KeyError, ValueError):
+                pass
+        if progress:
+            progress(min(s + chunk, len(tickers)), len(tickers))
+    return out
 
 
 def load_daily(ticker, cache_dir, refresh=False):
@@ -297,38 +341,56 @@ def plot_tf(ev, hz, tf, out_dir):
 
 
 # ----------------------------------------------------------------------------- ana akış
+def collect_events(daily, tf, p):
+    rows = []
+    for tk, df in daily.items():
+        bars = resample(df, tf)
+        if len(bars) < p['atr_len'] + 10:
+            continue
+        rows += extract_events(bars, tf, tk, p)
+    return pd.DataFrame(rows)
+
+
+def analyze(ev, rng):
+    """Bir TF'nin olaylarından tüm tabloları üretir."""
+    res = dict(
+        n=len(ev), n_up=int(np.sum(ev.dir == 'up')), n_down=int(np.sum(ev.dir == 'down')),
+        med_depth=float(ev.depth.median()),
+        clustering=clustering(ev['depth'].to_numpy(), rng),
+        hazard=hazard(ev['depth'].to_numpy()),
+        trd=outcome_table(ev, 'trd'), desc=outcome_table(ev, 'desc'),
+        volume=volume_table(ev), by_dir={})
+    for d_ in ['up', 'down']:
+        sub = ev[ev.dir == d_]
+        if len(sub) > 30:
+            res['by_dir'][d_] = outcome_table(sub, 'trd')
+    return res
+
+
 def run(daily, tfs, params, out_dir, rng, write=True):
     report = []
     all_ev = []
     for tf in tfs:
-        rows = []
-        for tk, df in daily.items():
-            bars = resample(df, tf)
-            if len(bars) < params[tf]['atr_len'] + 10:
-                continue
-            rows += extract_events(bars, tf, tk, params[tf])
-        ev = pd.DataFrame(rows)
+        ev = collect_events(daily, tf, params[tf])
         if ev.empty:
             report.append(f'\n## {tf}: olay yok\n')
             continue
         all_ev.append(ev)
-        hz = hazard(ev['depth'].to_numpy())
-        cl = clustering(ev['depth'].to_numpy(), rng)
+        r = analyze(ev, rng)
+        hz = r['hazard']
         sec = [f'\n## {tf}  (parametreler: {params[tf]})',
-               f'Olay sayısı: {len(ev)}  (up {np.sum(ev.dir == "up")}, down {np.sum(ev.dir == "down")})',
-               f'Medyan derinlik: {ev.depth.median():.3f}',
+               f'Olay sayısı: {r["n"]}  (up {r["n_up"]}, down {r["n_down"]})',
+               f'Medyan derinlik: {r["med_depth"]:.3f}',
                '\n### Kümelenme (excess_ratio>1 ve pctile yüksek = Fib gerçekten "özel")',
-               cl.to_string(index=False),
+               r['clustering'].to_string(index=False),
                '\n### Sonuç — işlenebilir (onay barından giriş, stop = düzeltme dibi)',
-               outcome_table(ev, 'trd').to_string(),
+               r['trd'].to_string(),
                '\n### Sonuç — tanımlayıcı (dipten itibaren, hindsight)',
-               outcome_table(ev, 'desc').to_string(),
+               r['desc'].to_string(),
                '\n### Hacim filtresi — P(1.272) işlenebilir',
-               volume_table(ev).to_string()]
-        for d_ in ['up', 'down']:
-            sub = ev[ev.dir == d_]
-            if len(sub) > 30:
-                sec += [f'\n### Yön: {d_} — işlenebilir', outcome_table(sub, 'trd').to_string()]
+               r['volume'].to_string()]
+        for d_, t in r['by_dir'].items():
+            sec += [f'\n### Yön: {d_} — işlenebilir', t.to_string()]
         report += sec
         if write:
             hz.to_csv(os.path.join(out_dir, f'{tf}_hazard.csv'), index=False)
@@ -410,5 +472,17 @@ def main():
         run(daily, tfs, TF_PARAMS, args.out, rng)
 
 
+def _in_streamlit():
+    try:
+        from streamlit.runtime import exists
+        return exists()
+    except Exception:
+        return False
+
+
 if __name__ == '__main__':
-    main()
+    if _in_streamlit():  # Streamlit Cloud bu dosyayı ana dosya olarak çalıştırırsa arayüzü aç
+        import streamlit_app
+        streamlit_app.render()
+    else:
+        main()
