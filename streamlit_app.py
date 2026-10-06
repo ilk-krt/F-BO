@@ -21,8 +21,13 @@ def get_data(tickers: tuple):
     data = fs.fetch_many(list(tickers),
                          progress=lambda d, n: bar.progress(d / n, text=f'Veri indiriliyor… {d}/{n}'))
     bar.empty()
-    # bellek için float32
     return {k: v.astype('float32') for k, v in data.items()}
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def get_bench():
+    d = fs.fetch_many([fs.BENCH])
+    return d.get(fs.BENCH)
 
 
 def fig_depth_hazard(ev, hz, tf):
@@ -93,11 +98,14 @@ def render():
         if not data:
             st.error('Hiç veri indirilemedi (Yahoo erişimi / sembol hatası).')
             return
+        bench = get_bench()
+        if bench is None:
+            st.warning('Endeks verisi alınamadı; Mum Gücü testi atlanacak.')
         rng = np.random.default_rng(42)
         results = {}
         for tf in [t for t in fs.TF_ORDER if t in tfs]:
             with st.spinner(f'{tf} analiz ediliyor…'):
-                ev = fs.collect_events(data, tf, params[tf])
+                ev = fs.collect_events(data, tf, params[tf], bench)
                 if not ev.empty:
                     results[tf] = (ev, fs.analyze(ev, rng), params[tf])
         st.session_state['res'] = results
@@ -138,6 +146,25 @@ def render():
                 st.dataframe(r['volume'], width='stretch')
             with st.expander('Sonuç — tanımlayıcı (dipten itibaren, hindsight → iyimser)'):
                 st.dataframe(fmt(r['desc']), width='stretch')
+
+            mg = r.get('mg')
+            if mg:
+                st.subheader('🕯️ Mum Gücü testi')
+                st.caption('Soru: Fib setup\'ında Mum Gücü teyidi sonucu iyileştiriyor mu? '
+                           '"düz_fark" = derinlik ve düzeltme süresi etkisi ayıklanmış fark. '
+                           'GA95 hisse bazlı bootstrap. Sıfırı içermiyorsa → anlamlı. '
+                           'Çok sayıda test var: tek bir "EVET" şans eseri olabilir; '
+                           'M ve W\'de ve iki dönemde de tutarlı olmalı.')
+                for d_, m in mg.items():
+                    st.markdown(f"**{'Yukarı' if d_ == 'up' else 'Aşağı'} setup'lar**")
+                    st.dataframe(m['components'], hide_index=True, width='stretch')
+                    st.dataframe(m['by_score'].style.format({'P1': '{:.1%}', 'P1272': '{:.1%}', 'P1618': '{:.1%}',
+                                                             'meanR': '{:.2f}', 'medR': '{:.2f}', 'n': '{:.0f}'}),
+                                 width='stretch')
+                    with st.expander('Derinlik / süre / dönem kırılımı'):
+                        st.dataframe(m['by_depth'], width='stretch')
+                        st.dataframe(m['by_len'], width='stretch')
+                        st.dataframe(m['by_era'], width='stretch')
 
             buf = io.StringIO()
             ev.to_csv(buf, index=False)

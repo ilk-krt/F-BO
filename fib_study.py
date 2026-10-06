@@ -226,12 +226,132 @@ def track(h, l, start, horizon, n, sign, p0, imp, stop):
     return res
 
 
+# ----------------------------------------------------------------------------- Mum Gücü (Apex v666/v667 motoru)
+MG_LOOKN = {'M': 120, '2W': 130, 'W': 260, '3D': 500, 'D': 500}
+MG = dict(min_samp=15, rvol_len=12, beta_len=36, hi_vol=70, lo_vol=40, big_mv=70,
+          sml_mv=40, rel_hi=65, rel_lo=35, wick=0.40)
+BENCH = '^GSPC'  # 1927'den beri; SPY ile pratikte aynı
+
+
+def _roll_pct(x, valid, look, min_samp):
+    """Pine Dist.pct: önceki `look` mumdaki geçerli değerler içinde orta-sıra persentili."""
+    from numpy.lib.stride_tricks import sliding_window_view
+    n = len(x)
+    out = np.full(n, np.nan)
+    xv = np.where(valid & ~np.isnan(x), x, np.nan)
+    W = sliding_window_view(np.concatenate([np.full(look, np.nan), xv]), look)[:n]
+    cnt = np.sum(~np.isnan(W), 1)
+    with np.errstate(invalid='ignore'):
+        lt = np.sum(W < x[:, None], 1)
+        le = np.sum(W <= x[:, None], 1)
+    ok = (cnt >= min_samp) & ~np.isnan(x)
+    out[ok] = (lt[ok] + le[ok]) / 2 / cnt[ok] * 100
+    return out
+
+
+def mum_gucu(df, bench_close, look):
+    """Her mum için Pine v667 ile aynı cls / syn kodlarını döndürür."""
+    m = MG
+    o, h, l, c, v = (df[k].to_numpy(float) for k in ['Open', 'High', 'Low', 'Close', 'Volume'])
+    pc = np.r_[np.nan, c[:-1]]
+    mv = (c - pc) / pc * 100
+    d = np.where(np.isnan(mv), 0, np.sign(mv)).astype(int)
+    absmv = np.abs(mv)
+    vavg = pd.Series(v).rolling(m['rvol_len']).mean().shift(1).to_numpy()
+    rvol = np.where(vavg > 0, v / np.where(vavg > 0, vavg, 1), np.nan)
+    rng = h - l
+    hr = rng > 0
+    safe = np.where(hr, rng, 1)
+    clv = np.where(hr, (c - l) / safe, 0.5)
+    upw = np.where(hr, (h - np.maximum(o, c)) / safe, 0.0)
+    low_ = np.where(hr, (np.minimum(o, c) - l) / safe, 0.0)
+    clstr = np.where(d == 1, clv, np.where(d == -1, 1 - clv, 0.5))
+
+    b = np.asarray(bench_close, float)
+    br = np.r_[np.nan, (b[1:] / b[:-1] - 1) * 100]
+    s_mv, s_br = pd.Series(mv), pd.Series(br)
+    L = m['beta_len']
+    sdS = s_mv.rolling(L).std(ddof=0)
+    sdB = s_br.rolling(L).std(ddof=0)
+    corr = s_mv.rolling(L).corr(s_br)
+    beta_now = (corr * sdS / sdB).where(sdB > 0)
+    beta = beta_now.shift(1).fillna(1.0).to_numpy()
+    alpha = mv - beta * br
+
+    ms = m['min_samp']
+    volP = _roll_pct(rvol, np.ones(len(c), bool), look, ms)
+    upP = _roll_pct(absmv, d == 1, look, ms)
+    dnP = _roll_pct(absmv, d == -1, look, ms)
+    mvP = np.where(d == 1, upP, np.where(d == -1, dnP, np.nan))
+    exP = _roll_pct(alpha, np.ones(len(c), bool), look, ms)
+
+    ready = ~np.isnan(volP) & ~np.isnan(mvP)
+    with np.errstate(invalid='ignore'):
+        hv, lv = volP >= m['hi_vol'], volP <= m['lo_vol']
+        bm, sm = mvP >= m['big_mv'], mvP <= m['sml_mv']
+    W_ = m['wick']
+    cls_up = np.select([hv & (upw >= W_), hv & sm & (low_ >= W_), hv & bm & (clstr >= .6),
+                        hv & sm, bm & lv, hv | bm], [11, 10, 1, 11, 3, 2], 0)
+    cls_dn = np.select([hv & (low_ >= W_), hv & sm & (upw >= W_), hv & bm & (clstr >= .6),
+                        hv & sm, bm & lv, hv | bm], [10, 11, -1, 10, -3, -2], 0)
+    cls = np.where(ready & (d == 1), cls_up, np.where(ready & (d == -1), cls_dn, 0))
+
+    with np.errstate(invalid='ignore'):
+        rS, rW = exP >= m['rel_hi'], exP <= m['rel_lo']
+    syn = np.select(
+        [cls == 1, cls == 2, cls == 3, cls == -1, cls == -2, cls == -3, cls == 10, cls == 11],
+        [np.where(rS, 2, np.where(rW, 0, 1)), np.where(rS, 1, 0),
+         np.where(rW, -4, np.where(rS, 1, 0)), np.where(rW, -2, np.where(rS, 0, -1)),
+         np.where(rW, -1, 0), np.where(rS, 4, np.where(rW, -1, 0)),
+         np.where(rS, 3, np.where(rW, 0, 1)), np.where(rW, -3, np.where(rS, 0, -1))], 0)
+    syn = np.where(ready & ~np.isnan(exP), syn, 0)
+    return cls, syn, exP
+
+
+def mg_features(cls, syn, exP, sign, i1, i2, c2):
+    """Pine v667 setup bloğundaki Mum Gücü teyidi."""
+    pc_, ps_ = cls[i1 + 1:i2 + 1], syn[i1 + 1:i2 + 1]
+    lc, ls = cls[i2 + 1:c2 + 1], syn[i2 + 1:c2 + 1]
+    if sign == 1:
+        ab = np.any((pc_ == 10) | (ps_ == 3) | (ps_ == 4))
+        di = np.any((ps_ == -2) | (ps_ == -3))
+        st_ = np.any((ls == 2) | (lc == 1) | ((lc == 2) & (ls == 1)))
+        bad = np.any((lc == 11) | (ls == -3) | (ls == -4))
+    else:
+        ab = np.any((pc_ == 11) | (ps_ == -3))
+        di = np.any((ps_ == 2) | (ps_ == 3))
+        st_ = np.any((ls == -2) | (lc == -1) | ((lc == -2) & (ls == -1)))
+        bad = np.any((lc == 10) | (ls == 3) | (ls == 4))
+    return dict(mg_abs_pull=bool(ab), mg_dis_pull=bool(di), mg_str_leg=bool(st_),
+                mg_bad_leg=bool(bad), mg=int(ab) + int(st_) - int(bad) - int(di),
+                mg_exP_conf=exP[c2], mg_syn_conf=int(syn[c2]))
+
+
+def realized_R(h, l, c, start, horizon, n, sign, entry, stop, target):
+    """Gerçekleşen R: 1.272 hedefi → +RR, stop → -1, ikisi de yoksa horizon sonunda kapanış."""
+    risk = sign * (entry - stop)
+    if risk <= 0:
+        return np.nan
+    end = min(n - 1, start + horizon - 1)
+    for j in range(start, end + 1):
+        if (l[j] < stop) if sign == 1 else (h[j] > stop):
+            return -1.0
+        if (h[j] >= target) if sign == 1 else (l[j] <= target):
+            return sign * (target - entry) / risk
+    if end - start + 1 < horizon:
+        return np.nan  # veri bitti, sonuç belirsiz
+    return sign * (c[end] - entry) / risk
+
+
 # ----------------------------------------------------------------------------- olay çıkarımı
-def extract_events(df, tf, ticker, p):
+def extract_events(df, tf, ticker, p, bench_close=None):
     h, l, c, v = (df[k].to_numpy(float) for k in ['High', 'Low', 'Close', 'Volume'])
     n = len(h)
     a = wilder_atr(h, l, c, p['atr_len'])
     piv = zigzag(h, l, a, p['rev_mult'])
+    mg = None
+    if bench_close is not None:
+        mg = mum_gucu(df, bench_close, MG_LOOKN.get(tf, 500))
     rows = []
     for k in range(len(piv) - 2):
         (i0, p0, t0, _), (i1, p1, _, _), (i2, p2, _, c2) = piv[k], piv[k + 1], piv[k + 2]
@@ -256,6 +376,9 @@ def extract_events(df, tf, ticker, p):
         tgt = p0 + sign * 1.272 * imp
         row['trd_rr_1272'] = sign * (tgt - entry) / risk if risk > 0 else np.nan
         row.update({f'trd_{key}': val for key, val in t.items()})
+        row['trd_R'] = realized_R(h, l, c, c2 + 1, p['horizon'], n, sign, entry, p2, tgt)
+        if mg is not None:
+            row.update(mg_features(*mg, sign, i1, i2, c2))
         rows.append(row)
     return rows
 
@@ -341,14 +464,108 @@ def plot_tf(ev, hz, tf, out_dir):
 
 
 # ----------------------------------------------------------------------------- ana akış
-def collect_events(daily, tf, p):
+def collect_events(daily, tf, p, bench=None):
     rows = []
+    bclose = bench['Close'].astype(float) if bench is not None else None
     for tk, df in daily.items():
         bars = resample(df, tf)
         if len(bars) < p['atr_len'] + 10:
             continue
-        rows += extract_events(bars, tf, tk, p)
+        bc = None
+        if bclose is not None:
+            bc = bclose.reindex(bclose.index.union(bars.index)).ffill().reindex(bars.index).to_numpy()
+        rows += extract_events(bars, tf, tk, p, bc)
     return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------- Mum Gücü testi
+MG_FLAGS = [('mg_abs_pull', 'Düzeltmede absorpsiyon/silkeleme'),
+            ('mg_str_leg', 'Dönüş bacağında güçlü mum'),
+            ('mg_bad_leg', 'Dönüş bacağında dağıtım/fake'),
+            ('mg_dis_pull', 'Düzeltmede ters A+ mum')]
+
+
+def _grp_stats(e):
+    return pd.Series(dict(n=len(e), P1=e['trd_hit_1.0'].mean(), P1272=e['trd_hit_1.272'].mean(),
+                          P1618=e['trd_hit_1.618'].mean(), meanR=e['trd_R'].mean(),
+                          medR=e['trd_R'].median()))
+
+
+def _boot_diff(e, mask, col, reps, rng, strata=None):
+    """mean(col | mask) - mean(col | ~mask), hisse bazında küme bootstrap %95 GA.
+    strata verilirse: tabaka içi farkların ağırlıklı ortalaması (derinlik × süre etkisini ayıklar)."""
+    uniq, inv = np.unique(e['ticker'].to_numpy(), return_inverse=True)
+    x = e[col].to_numpy(float)
+    ok = ~np.isnan(x)
+    mk = mask.to_numpy()
+    st_ = np.zeros(len(e), int) if strata is None else pd.factorize(strata)[0]
+    U = len(uniq)
+    parts = []
+    for sidx in np.unique(st_):
+        ins = st_ == sidx
+        def sums(sel):
+            sel = sel & ok & ins
+            return (np.bincount(inv, weights=np.where(sel, x, 0), minlength=U),
+                    np.bincount(inv, weights=sel.astype(float), minlength=U))
+        parts.append(sums(mk) + sums(~mk))
+
+    def combine(w):
+        num = den = 0.0
+        for s1, k1, s0, k0 in parts:
+            K1, K0 = (w * k1).sum(), (w * k0).sum()
+            if K1 > 0 and K0 > 0:
+                wt = K1 * K0 / (K1 + K0)
+                num += wt * ((w * s1).sum() / K1 - (w * s0).sum() / K0)
+                den += wt
+        return num / den if den > 0 else np.nan
+
+    point = combine(np.ones(U))
+    diffs = [combine(np.bincount(rng.integers(0, U, U), minlength=U)) for _ in range(reps)]
+    diffs = [d for d in diffs if not np.isnan(d)]
+    lo, hi = np.percentile(diffs, [2.5, 97.5]) if diffs else (np.nan, np.nan)
+    return point, lo, hi
+
+
+def mg_analysis(ev, rng, reps=300):
+    """Mum Gücü teyidi Fib setup sonucunu iyileştiriyor mu?"""
+    if 'mg' not in ev.columns:
+        return None
+    e0 = ev[ev['trd_complete'] & (ev['depth'] < 1.0) & ev['trd_R'].notna()].copy()
+    e0['mg_grp'] = pd.cut(e0['mg'], [-9, -1, 0, 1, 9], labels=['≤-1 ZAYIF', '0 NÖTR', '1 POZİTİF', '≥2 GÜÇLÜ'])
+    e0['derinlik'] = np.where(e0['depth'] <= 0.618, 'sığ ≤0.618', 'derin >0.618')
+    e0['dönem'] = np.where(pd.to_datetime(e0['date_conf']).dt.year < 2000, '<2000', '≥2000')
+    e0['süre'] = pd.cut(e0['pullback_bars'], [-1, 3, 8, 10**6], labels=['≤3 mum', '4-8 mum', '>8 mum'])
+    e0['tabaka'] = e0['derinlik'] + '|' + e0['süre'].astype(str)
+    out = {}
+    for d_ in ['up', 'down']:
+        e = e0[e0.dir == d_]
+        if len(e) < 30:
+            continue
+        r = {}
+        r['by_score'] = e.groupby('mg_grp', observed=False).apply(_grp_stats).round(3)
+        r['by_depth'] = e.groupby(['derinlik', 'mg_grp'], observed=False).apply(_grp_stats).round(3)
+        r['by_era'] = e.groupby(['dönem', 'mg_grp'], observed=False).apply(_grp_stats).round(3)
+        r['by_len'] = e.groupby(['süre', 'mg_grp'], observed=False).apply(_grp_stats).round(3)
+        comp = []
+        for col, name in MG_FLAGS + [('_ap', 'Skor ≥2 (★A+)')]:
+            mask = (e['mg'] >= 2) if col == '_ap' else e[col].astype(bool)
+            if mask.sum() < 10 or (~mask).sum() < 10:
+                continue
+            rawP = e.loc[mask, 'trd_hit_1.272'].mean() - e.loc[~mask, 'trd_hit_1.272'].mean()
+            rawR = e.loc[mask, 'trd_R'].mean() - e.loc[~mask, 'trd_R'].mean()
+            dP, pl, ph = _boot_diff(e, mask, 'trd_hit_1.272', reps, rng, e['tabaka'])
+            dR, rl, rh = _boot_diff(e, mask, 'trd_R', reps, rng, e['tabaka'])
+            comp.append(dict(özellik=name, n_var=int(mask.sum()), n_yok=int((~mask).sum()),
+                             P1272_var=e.loc[mask, 'trd_hit_1.272'].mean(),
+                             P1272_yok=e.loc[~mask, 'trd_hit_1.272'].mean(),
+                             ham_fark_P=rawP, düz_fark_P=dP, GA95_P=f'[{pl:+.3f}, {ph:+.3f}]',
+                             meanR_var=e.loc[mask, 'trd_R'].mean(), meanR_yok=e.loc[~mask, 'trd_R'].mean(),
+                             ham_fark_R=rawR, düz_fark_R=dR, GA95_R=f'[{rl:+.2f}, {rh:+.2f}]',
+                             anlamlı_P='EVET' if (pl > 0 or ph < 0) else 'hayır',
+                             anlamlı_R='EVET' if (rl > 0 or rh < 0) else 'hayır'))
+        r['components'] = pd.DataFrame(comp).round(3)
+        out[d_] = r
+    return out
 
 
 def analyze(ev, rng):
@@ -364,14 +581,15 @@ def analyze(ev, rng):
         sub = ev[ev.dir == d_]
         if len(sub) > 30:
             res['by_dir'][d_] = outcome_table(sub, 'trd')
+    res['mg'] = mg_analysis(ev, rng)
     return res
 
 
-def run(daily, tfs, params, out_dir, rng, write=True):
+def run(daily, tfs, params, out_dir, rng, write=True, bench=None):
     report = []
     all_ev = []
     for tf in tfs:
-        ev = collect_events(daily, tf, params[tf])
+        ev = collect_events(daily, tf, params[tf], bench)
         if ev.empty:
             report.append(f'\n## {tf}: olay yok\n')
             continue
@@ -391,6 +609,12 @@ def run(daily, tfs, params, out_dir, rng, write=True):
                r['volume'].to_string()]
         for d_, t in r['by_dir'].items():
             sec += [f'\n### Yön: {d_} — işlenebilir', t.to_string()]
+        if r.get('mg'):
+            for d_, m in r['mg'].items():
+                sec += [f'\n### MUM GÜCÜ TESTİ — {d_}', 'Skora göre:', m['by_score'].to_string(),
+                        'Bileşenler (hisse bazlı bootstrap %95 GA):', m['components'].to_string(index=False),
+                        'Derinliğe göre:', m['by_depth'].to_string(), 'Süreye göre:', m['by_len'].to_string(),
+                        'Döneme göre:', m['by_era'].to_string()]
         report += sec
         if write:
             hz.to_csv(os.path.join(out_dir, f'{tf}_hazard.csv'), index=False)
@@ -450,9 +674,11 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     daily = {}
+    bench = None
     if args.synthetic:
         for i in range(40):
             daily[f'SYN{i}'] = synthetic_daily(args.seed + i)
+        bench = synthetic_daily(999)
     else:
         tickers = load_universe(args.tickers)
         for i, tk in enumerate(tickers, 1):
@@ -464,12 +690,16 @@ def main():
                 print(f'{tk}: hata {ex}', file=sys.stderr)
             if i % 50 == 0:
                 print(f'{i}/{len(tickers)} indirildi')
+        try:
+            bench = load_daily(BENCH, args.cache, args.refresh)
+        except Exception as ex:
+            print(f'Endeks ({BENCH}) alınamadı, Mum Gücü testi atlanacak: {ex}', file=sys.stderr)
     print(f'{len(daily)} hisse yüklendi, TF: {tfs}')
 
     if args.sweep:
         sweep(daily, [t for t in tfs if t in ('M', 'W')] or tfs, rng, args.out)
     else:
-        run(daily, tfs, TF_PARAMS, args.out, rng)
+        run(daily, tfs, TF_PARAMS, args.out, rng, bench=bench)
 
 
 def _in_streamlit():
