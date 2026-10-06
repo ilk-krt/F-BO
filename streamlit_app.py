@@ -26,8 +26,14 @@ def get_data(tickers: tuple):
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def get_bench():
-    d = fs.fetch_many([fs.BENCH])
-    return d.get(fs.BENCH)
+    for sym in [fs.BENCH, 'SPY']:  # ^GSPC olmazsa SPY
+        try:
+            df = fs.fetch_many([sym]).get(sym)
+            if df is not None:
+                return df
+        except Exception:
+            pass
+    return None
 
 
 def fig_depth_hazard(ev, hz, tf):

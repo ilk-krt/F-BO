@@ -101,7 +101,12 @@ def fetch_many(tickers, chunk=100, progress=None):
                           group_by='ticker', threads=True, progress=False)
         for tk in part:
             try:
-                df = raw[tk] if len(part) > 1 else raw
+                df = raw
+                if isinstance(raw.columns, pd.MultiIndex):
+                    if tk in raw.columns.get_level_values(0):
+                        df = raw[tk]
+                    elif tk in raw.columns.get_level_values(1):
+                        df = raw.xs(tk, axis=1, level=1)
                 df = _clean(df.copy())
                 if df is not None:
                     out[tk] = df
