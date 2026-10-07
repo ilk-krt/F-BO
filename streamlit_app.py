@@ -65,6 +65,7 @@ def fmt(t):
 def render():
     st.set_page_config(page_title='Fibonacci Çalışması', layout='wide')
     st.title('Fibonacci Ampirik Çalışma')
+    st.caption(f"Kod sürümü: {getattr(fs, '__version__', 'ESKİ — fib_study.py güncellenmemiş!')}")
     st.caption('Düzeltme dipleri Fib seviyelerinde gerçekten birikiyor mu, '
                've hangi derinlikten sonra trend devam ediyor?')
 
@@ -152,6 +153,17 @@ def render():
                 st.dataframe(r['volume'], width='stretch')
             with st.expander('Sonuç — tanımlayıcı (dipten itibaren, hindsight → iyimser)'):
                 st.dataframe(fmt(r['desc']), width='stretch')
+
+            tg = r.get('targets')
+            if tg:
+                st.subheader('🎯 Hedef testi — hangi hedef daha çok R kazandırıyor?')
+                st.caption('Yukarı setup\'lar, gerçekleşen ortalama R. Stop = düzeltme dibi, '
+                           'hedefe ya da stopa gelmezse vade sonunda kapanış. '
+                           'Fark tablosu aynı olaylarda 1.272 hedefine göre karşılaştırma.')
+                st.dataframe(tg['means'].style.format('{:.3f}', subset=[c for c in tg['means'].columns if c != 'n']),
+                             width='stretch')
+                with st.expander('1.272\'ye göre farklar + güven aralığı'):
+                    st.dataframe(tg['diffs'], hide_index=True, width='stretch')
 
             mg = r.get('mg')
             if mg:

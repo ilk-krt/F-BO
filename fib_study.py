@@ -31,6 +31,8 @@ Kullanım:
 
 Not: Wikipedia S&P 500 listesi BUGÜNKÜ üyelerdir -> survivorship bias.
 """
+__version__ = 'v3 · hedef testi'
+
 import argparse
 import os
 import sys
@@ -332,6 +334,36 @@ def mg_features(cls, syn, exP, sign, i1, i2, c2):
                 mg_exP_conf=exP[c2], mg_syn_conf=int(syn[c2]))
 
 
+TARGET_EXTS = [1.0, 1.272, 1.618, 2.0, 2.618]
+
+
+def realized_scale(h, l, c, start, horizon, n, sign, entry, stop, t1, t2):
+    """Yarısı t1'de kapanır, stop girişe çekilir, kalan yarı t2'de / girişte / vade sonunda."""
+    risk = sign * (entry - stop)
+    if risk <= 0:
+        return np.nan
+    end = min(n - 1, start + horizon - 1)
+    half = None
+    for j in range(start, end + 1):
+        hi_, lo_ = h[j], l[j]
+        if half is None:
+            if (lo_ < stop) if sign == 1 else (hi_ > stop):
+                return -1.0
+            if (hi_ >= t1) if sign == 1 else (lo_ <= t1):
+                half = 0.5 * sign * (t1 - entry) / risk
+                if (hi_ >= t2) if sign == 1 else (lo_ <= t2):
+                    return half + 0.5 * sign * (t2 - entry) / risk
+        else:
+            if (lo_ < entry) if sign == 1 else (hi_ > entry):
+                return half
+            if (hi_ >= t2) if sign == 1 else (lo_ <= t2):
+                return half + 0.5 * sign * (t2 - entry) / risk
+    if end - start + 1 < horizon:
+        return np.nan
+    rest = 0.5 * sign * (c[end] - entry) / risk
+    return (half + rest) if half is not None else 2 * rest
+
+
 def realized_R(h, l, c, start, horizon, n, sign, entry, stop, target):
     """Gerçekleşen R: 1.272 hedefi → +RR, stop → -1, ikisi de yoksa horizon sonunda kapanış."""
     risk = sign * (entry - stop)
@@ -382,6 +414,11 @@ def extract_events(df, tf, ticker, p, bench_close=None):
         row['trd_rr_1272'] = sign * (tgt - entry) / risk if risk > 0 else np.nan
         row.update({f'trd_{key}': val for key, val in t.items()})
         row['trd_R'] = realized_R(h, l, c, c2 + 1, p['horizon'], n, sign, entry, p2, tgt)
+        for e_ in TARGET_EXTS:
+            row[f'trd_R_{e_}'] = realized_R(h, l, c, c2 + 1, p['horizon'], n, sign, entry, p2,
+                                            p0 + sign * e_ * imp)
+        row['trd_R_scale'] = realized_scale(h, l, c, c2 + 1, p['horizon'], n, sign, entry, p2,
+                                            p0 + sign * 1.272 * imp, p0 + sign * 1.618 * imp)
         if mg is not None:
             row.update(mg_features(*mg, sign, i1, i2, c2))
         rows.append(row)
@@ -531,6 +568,60 @@ def _boot_diff(e, mask, col, reps, rng, strata=None):
     return point, lo, hi
 
 
+def _boot_mean(e, col, reps, rng):
+    """Hisse bazlı küme bootstrap ile ortalama ve %95 GA."""
+    x = e[col].to_numpy(float)
+    ok = ~np.isnan(x)
+    uniq, inv = np.unique(e['ticker'].to_numpy(), return_inverse=True)
+    U = len(uniq)
+    s_ = np.bincount(inv, weights=np.where(ok, x, 0), minlength=U)
+    k_ = np.bincount(inv, weights=ok.astype(float), minlength=U)
+    m = []
+    for _ in range(reps):
+        w = np.bincount(rng.integers(0, U, U), minlength=U)
+        if (w * k_).sum() > 0:
+            m.append((w * s_).sum() / (w * k_).sum())
+    point = s_.sum() / k_.sum() if k_.sum() else np.nan
+    lo, hi = np.percentile(m, [2.5, 97.5]) if m else (np.nan, np.nan)
+    return point, lo, hi
+
+
+TARGET_COLS = [(f'trd_R_{e}', f'Hedef {e}') for e in TARGET_EXTS] + [('trd_R_scale', 'Yarı 1.272 + yarı 1.618 (stop→giriş)')]
+
+
+def target_analysis(ev, rng, reps=300):
+    """Hangi hedef en yüksek ortalama R'yi veriyor? MG skoruna göre, yukarı setup'lar."""
+    if 'trd_R_1.618' not in ev.columns:
+        return None
+    e0 = ev[ev['trd_complete'] & (ev['depth'] < 1.0) & (ev['dir'] == 'up')].copy()
+    cols = [c for c, _ in TARGET_COLS]
+    e0 = e0.dropna(subset=cols)
+    if len(e0) < 30:
+        return None
+    groups = [('Tümü', e0)]
+    if 'mg' in e0.columns:
+        groups += [('MG ≤-1', e0[e0.mg <= -1]), ('MG 0', e0[e0.mg == 0]),
+                   ('MG 1', e0[e0.mg == 1]), ('MG ≥2 ★A+', e0[e0.mg >= 2])]
+    mean_rows, diff_rows = [], []
+    for gname, g in groups:
+        if len(g) < 30:
+            continue
+        row = {'grup': gname, 'n': len(g)}
+        for c, name in TARGET_COLS:
+            row[name] = g[c].mean()
+        mean_rows.append(row)
+        # 1.272'ye göre eşleştirilmiş fark (aynı olaylar)
+        for c, name in TARGET_COLS:
+            if c == 'trd_R_1.272':
+                continue
+            g = g.assign(_d=g[c] - g['trd_R_1.272'])
+            d, lo, hi = _boot_mean(g, '_d', reps, rng)
+            diff_rows.append(dict(grup=gname, hedef=name, fark_R=d, GA95=f'[{lo:+.3f}, {hi:+.3f}]',
+                                  anlamlı='EVET' if (lo > 0 or hi < 0) else 'hayır'))
+    return dict(means=pd.DataFrame(mean_rows).set_index('grup').round(3),
+                diffs=pd.DataFrame(diff_rows).round(3))
+
+
 def mg_analysis(ev, rng, reps=300):
     """Mum Gücü teyidi Fib setup sonucunu iyileştiriyor mu?"""
     if 'mg' not in ev.columns:
@@ -587,6 +678,7 @@ def analyze(ev, rng):
         if len(sub) > 30:
             res['by_dir'][d_] = outcome_table(sub, 'trd')
     res['mg'] = mg_analysis(ev, rng)
+    res['targets'] = target_analysis(ev, rng)
     return res
 
 
@@ -614,6 +706,9 @@ def run(daily, tfs, params, out_dir, rng, write=True, bench=None):
                r['volume'].to_string()]
         for d_, t in r['by_dir'].items():
             sec += [f'\n### Yön: {d_} — işlenebilir', t.to_string()]
+        if r.get('targets'):
+            sec += ['\n### HEDEF TESTİ — yukarı setup, ortalama gerçekleşen R', r['targets']['means'].to_string(),
+                    '1.272\'ye göre fark (eşleştirilmiş, hisse bazlı bootstrap):', r['targets']['diffs'].to_string(index=False)]
         if r.get('mg'):
             for d_, m in r['mg'].items():
                 sec += [f'\n### MUM GÜCÜ TESTİ — {d_}', 'Skora göre:', m['by_score'].to_string(),
