@@ -31,7 +31,7 @@ Kullanım:
 
 Not: Wikipedia S&P 500 listesi BUGÜNKÜ üyelerdir -> survivorship bias.
 """
-__version__ = 'v6 · yön motoru testi'
+__version__ = 'v6.1 · adil kıyas (sadece hazır mumlar)'
 
 import argparse
 import zlib
@@ -805,6 +805,42 @@ SIG_DEFS = [  # (ad, beklenen yön, koşul(sb))
 ]
 
 
+PAIRS = [  # (A, B, etiket) → A − B
+    ('🧭 Yön → YUKARI döndü', '🧭 Yön → AŞAĞI döndü', 'Yön yukarı döndü − aşağı döndü'),
+    ('🧭 Yön YUKARI iken (her mum)', '🧭 Yön AŞAĞI iken (her mum)', 'Yön yukarıyken − aşağıyken'),
+    ('🧭 Yön YUKARI, 5+ mumdur', '🧭 Yön AŞAĞI, 5+ mumdur', 'Yön 5+ mum yukarı − 5+ mum aşağı'),
+    ('🟢 Güçlü yükseliş (cls 1, tümü)', '🔴 Güçlü düşüş (cls -1, tümü)', 'Güçlü yükseliş mumu − güçlü düşüş mumu'),
+    ('🟢 Güçlü yükseliş (cls 1, tümü)', '🟡 Hacimsiz yükseliş (cls 3)', 'Hacimli yükseliş − hacimsiz yükseliş'),
+    ('🔵 Absorpsiyon (cls 10, tümü)', '🟠 Dağıtım (cls 11, tümü)', 'Absorpsiyon − dağıtım'),
+    ('Σ MG alım grubu (syn 2/3/4)', 'Σ MG satış grubu (syn -2/-3/-4)', 'MG alım grubu − satış grubu'),
+]
+
+
+def _pair_diff(sb, ma, mb, col, reps, rng):
+    """mean(col|A) − mean(col|B), tarih bazlı küme bootstrap."""
+    x = sb[col].to_numpy(float)
+    ok = ~np.isnan(x)
+    uniq, inv = np.unique(sb['date'].to_numpy(), return_inverse=True)
+    U = len(uniq)
+    def sums(m):
+        m = m & ok
+        return (np.bincount(inv, weights=np.where(m, x, 0), minlength=U),
+                np.bincount(inv, weights=m.astype(float), minlength=U))
+    sa, ka = sums(ma)
+    s_b, kb = sums(mb)
+    if ka.sum() < 30 or kb.sum() < 30:
+        return np.nan, np.nan, np.nan
+    pt = sa.sum() / ka.sum() - s_b.sum() / kb.sum()
+    d = []
+    for _ in range(reps):
+        w = np.bincount(rng.integers(0, U, U), minlength=U)
+        A, B = (w * ka).sum(), (w * kb).sum()
+        if A > 0 and B > 0:
+            d.append((w * sa).sum() / A - (w * s_b).sum() / B)
+    lo, hi = np.percentile(d, [2.5, 97.5])
+    return pt, lo, hi
+
+
 def signal_bars(daily, tf, bench):
     """Her hisse × her mum: cls, syn ve ileri getiriler (giriş = sinyal mumu kapanışı)."""
     H = SIG_HORIZONS.get(tf, [1, 5, 20])
@@ -822,7 +858,8 @@ def signal_bars(daily, tf, bench):
         yas = (np.arange(len(yon)) - np.maximum.accumulate(np.where(chg, np.arange(len(yon)), 0)) + 1)
         c = bars['Close'].to_numpy(float)
         d = {'ticker': tk, 'date': bars.index, 'cls': cls.astype(np.int8), 'syn': syn.astype(np.int8),
-             'yon': yon, 'yon_once': yon_once, 'yon_yas': yas.astype(np.int16)}
+             'yon': yon, 'yon_once': yon_once, 'yon_yas': yas.astype(np.int16),
+             'hazir': (it['ready'] & ~np.isnan(exP_))}
         for h in H:
             fwd = np.full(len(c), np.nan)
             fwd[:-h] = (c[h:] / c[:-h] - 1) * 100
@@ -838,6 +875,11 @@ def signal_analysis(sb, tf, rng, reps=300):
         return None
     H = SIG_HORIZONS.get(tf, [1, 5, 20])
     sb = sb.copy()
+    # ADİL KIYAS: sinyaller ancak Mum Gücü 'hazır' olunca (yeterli geçmiş) çıkabiliyor.
+    # Hazır olmayan mumlar çoğunlukla hisselerin ilk yılları → bugünkü S&P 500 üyelerinde
+    # (survivorship) bu dönemin getirisi şişik. Ortalama SADECE hazır mumlardan alınır.
+    if 'hazir' in sb.columns:
+        sb = sb[sb['hazir']].copy()
     for h in H:
         sb[f'x{h}'] = sb[f'r{h}'] - sb.groupby('date')[f'r{h}'].transform('mean')
     sb['dönem'] = np.where(pd.to_datetime(sb['date']).dt.year < 2000, '<2000', '≥2000')
@@ -869,7 +911,21 @@ def signal_analysis(sb, tf, rng, reps=300):
             era_rows.append(dict(sinyal=name, dönem=era, n=len(e), vade=f'+{hm}', fazla_getiri_pct=m,
                                  GA95=f'[{lo:+.2f}, {hi:+.2f}]'))
     base = {f'+{h} tüm mumlar ort. %': float(sb[f'r{h}'].mean()) for h in H}
+    # ÇİFT KIYAS: iki zıt sinyalin farkı (ortak yanlılıklar birbirini götürür)
+    pairs = []
+    defs = {n: (e, c) for n, e, c in SIG_DEFS}
+    for a_, b_, lab in PAIRS:
+        if a_ not in defs or b_ not in defs:
+            continue
+        ma, mb = defs[a_][1](sb).to_numpy(), defs[b_][1](sb).to_numpy()
+        r = dict(kıyas=lab)
+        for h in H:
+            m, lo, hi = _pair_diff(sb, ma, mb, f'x{h}', reps, rng)
+            r[f'+{h} fark %'] = m
+            r[f'+{h} GA95'] = f'[{lo:+.2f}, {hi:+.2f}]'
+        pairs.append(r)
     return dict(table=pd.DataFrame(rows).round(3), era=pd.DataFrame(era_rows).round(3),
+                pairs=pd.DataFrame(pairs).round(3),
                 base=base, n_bars=len(sb), horizons=H)
 
 
@@ -1000,6 +1056,7 @@ def main():
                 print(f'\n## {tf} — Mum Gücü sinyal testi ({r["n_bars"]} mum)')
                 print(r['table'].to_string(index=False))
                 print(r['era'].to_string(index=False))
+                print(r['pairs'].to_string(index=False))
         return
     if args.sweep:
         sweep(daily, [t for t in tfs if t in ('M', 'W')] or tfs, rng, args.out)

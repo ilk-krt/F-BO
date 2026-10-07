@@ -147,10 +147,14 @@ def render():
                            "✗ = ters yönde anlamlı, · = fark yok. Çok test var: tek ✓ şans olabilir, "
                            "M ve W\'de ve iki dönemde tutarlı olmalı.")
                 st.dataframe(sr['table'], hide_index=True, width='stretch')
+                if 'pairs' in sr and len(sr['pairs']):
+                    st.markdown('**Çift kıyas** — iki zıt sinyalin farkı (ortak yanlılıklar birbirini götürür; '
+                                'GA95 sıfırı içermiyorsa fark gerçek)')
+                    st.dataframe(sr['pairs'], hide_index=True, width='stretch')
                 with st.expander('Dönem kırılımı (<2000 / ≥2000)'):
                     st.dataframe(sr['era'], hide_index=True, width='stretch')
                 st.download_button(f'{tf} sinyal testi sonuçlarını indir (CSV)',
-                                   pd.concat([sr['table'].assign(tablo='ana'), sr['era'].assign(tablo='dönem')]).to_csv(index=False),
+                                   pd.concat([sr['table'].assign(tablo='ana'), sr['era'].assign(tablo='dönem')] + ([sr['pairs'].assign(tablo='çift')] if 'pairs' in sr else [])).to_csv(index=False),
                                    file_name=f'mg_signal_{tf}.csv', mime='text/csv', key=f'sigdl_{tf}')
                 st.divider()
             c = st.columns(4)
