@@ -31,7 +31,7 @@ Kullanım:
 
 Not: Wikipedia S&P 500 listesi BUGÜNKÜ üyelerdir -> survivorship bias.
 """
-__version__ = 'v5 · Mum Gücü sinyal testi'
+__version__ = 'v6 · yön motoru testi'
 
 import argparse
 import zlib
@@ -257,7 +257,7 @@ def _roll_pct(x, valid, look, min_samp):
     return out
 
 
-def mum_gucu(df, bench_close, look):
+def mum_gucu(df, bench_close, look, full=False):
     """Her mum için Pine v667 ile aynı cls / syn kodlarını döndürür."""
     m = MG
     o, h, l, c, v = (df[k].to_numpy(float) for k in ['Open', 'High', 'Low', 'Close', 'Volume'])
@@ -313,7 +313,38 @@ def mum_gucu(df, bench_close, look):
          np.where(rW, -1, 0), np.where(rS, 4, np.where(rW, -1, 0)),
          np.where(rS, 3, np.where(rW, 0, 1)), np.where(rW, -3, np.where(rS, 0, -1))], 0)
     syn = np.where(ready & ~np.isnan(exP), syn, 0)
+    if full:
+        return cls, syn, exP, dict(volP=volP, mvP=mvP, d=d, clv=clv, upw=upw, loww=low_, ready=ready)
     return cls, syn, exP
+
+
+DIR = dict(wV=0.40, wI=0.35, fTh=0.25, strongTh=0.65)  # v666 varsayılanları (sektör yok)
+
+
+def yon_motoru(exP, it):
+    """v666 YÖN MOTORU, 'Kurallı' mod: +1 yukarı, 0 yatay, -1 aşağı (her mumun kapanışında)."""
+    volP, mvP, d, clv, upw, loww, ready = (it[k] for k in ['volP', 'mvP', 'd', 'clv', 'upw', 'loww', 'ready'])
+    effort = np.where(np.isnan(volP), 50, volP) / 100
+    pMove = d * np.where(np.isnan(mvP), 0, mvP) / 100 * (0.4 + 0.6 * effort)
+    pClose = (2 * clv - 1) * effort
+    pWick = (loww - upw) * effort
+    vF = np.clip(0.45 * pMove + 0.35 * pClose + 0.20 * pWick, -1, 1)
+    iF = np.where(np.isnan(exP), 0, (exP - 50) / 50)
+    wSum = DIR['wV'] + DIR['wI']
+    netF = np.where(ready, DIR['wV'] / wSum * vF + DIR['wI'] / wSum * iF, 0.0)
+    push = np.where(netF >= DIR['fTh'], 1, np.where(netF <= -DIR['fTh'], -1, 0))
+    st = np.zeros(len(netF), np.int8)
+    cur = 0
+    for i in range(len(netF)):
+        if ready[i]:
+            p_ = push[i]
+            if cur == 0:
+                if p_ != 0:
+                    cur = p_
+            elif p_ == -cur:
+                cur = p_ if abs(netF[i]) >= DIR['strongTh'] else 0
+        st[i] = cur
+    return st
 
 
 def mg_features(cls, syn, exP, sign, i1, i2, c2):
@@ -619,6 +650,7 @@ def target_analysis(ev, rng, reps=300):
     """Hangi hedef en yüksek ortalama R'yi veriyor? MG skoruna göre, yukarı setup'lar."""
     if 'trd_R_1.618' not in ev.columns:
         return None
+    ev = _clipR(ev)
     e0 = ev[ev['trd_complete'] & (ev['depth'] < 1.0) & (ev['dir'] == 'up')].copy()
     cols = [c for c, _ in TARGET_COLS]
     e0 = e0.dropna(subset=cols)
@@ -648,10 +680,20 @@ def target_analysis(ev, rng, reps=300):
                 diffs=pd.DataFrame(diff_rows).round(3))
 
 
+def _clipR(ev):
+    """Veri hatalı (ATR≈0) tek olaylar R'yi binlerce yapabiliyor → R'yi [-1, 20] aralığına kırp."""
+    cols = [c for c in ev.columns if c.startswith('trd_R') or c.startswith('ctl_R')]
+    if cols:
+        ev = ev.copy()
+        ev[cols] = ev[cols].clip(-1, 20)
+    return ev
+
+
 def baseline_analysis(ev, rng, reps=300):
     """Setup, aynı hissede rastgele girişten (aynı stop/hedef R-katları) daha iyi mi?"""
     if 'ctl_R_1.272' not in ev.columns:
         return None
+    ev = _clipR(ev)
     e0 = ev[ev['trd_complete'] & (ev['depth'] < 1.0) & (ev['dir'] == 'up')].copy()
     e0['dönem'] = np.where(pd.to_datetime(e0['date_conf']).dt.year < 2000, '<2000', '≥2000')
     pairs = [(f'trd_R_{e}', f'ctl_R_{e}', f'Hedef {e}') for e in TARGET_EXTS] + \
@@ -677,6 +719,7 @@ def mg_analysis(ev, rng, reps=300):
     """Mum Gücü teyidi Fib setup sonucunu iyileştiriyor mu?"""
     if 'mg' not in ev.columns:
         return None
+    ev = _clipR(ev)
     e0 = ev[ev['trd_complete'] & (ev['depth'] < 1.0) & ev['trd_R'].notna()].copy()
     e0['mg_grp'] = pd.cut(e0['mg'], [-9, -1, 0, 1, 9], labels=['≤-1 ZAYIF', '0 NÖTR', '1 POZİTİF', '≥2 GÜÇLÜ'])
     e0['derinlik'] = np.where(e0['depth'] <= 0.618, 'sığ ≤0.618', 'derin >0.618')
@@ -736,20 +779,29 @@ def analyze(ev, rng):
 
 # ----------------------------------------------------------------------------- Mum Gücü SİNYAL testi (Fib'den bağımsız)
 SIG_HORIZONS = {'M': [1, 3, 6, 12], '2W': [1, 3, 6, 13], 'W': [1, 4, 13, 26], '3D': [1, 5, 20, 60], 'D': [1, 5, 20, 60]}
-SIG_DEFS = [  # (ad, beklenen yön, koşul)
-    ('✅ Kurumsal alım A+ (syn 2)', 1, lambda c, s: s == 2),
-    ('🔵 Güçlü absorpsiyon A+ (syn 3)', 1, lambda c, s: s == 3),
-    ('🪤 Silkeleme olası (syn 4)', 1, lambda c, s: s == 4),
-    ('🟢 Güçlü yükseliş (cls 1, tümü)', 1, lambda c, s: c == 1),
-    ('🔵 Absorpsiyon (cls 10, tümü)', 1, lambda c, s: c == 10),
-    ('🟡 Hacimsiz yükseliş (cls 3)', -1, lambda c, s: c == 3),
-    ('❌ Fake yükseliş (syn -4)', -1, lambda c, s: s == -4),
-    ('🩸 Hisseye özel çıkış A+ (syn -2)', -1, lambda c, s: s == -2),
-    ('🟠 Güçlü dağıtım A+ (syn -3)', -1, lambda c, s: s == -3),
-    ('🔴 Güçlü düşüş (cls -1, tümü)', -1, lambda c, s: c == -1),
-    ('🟠 Dağıtım (cls 11, tümü)', -1, lambda c, s: c == 11),
-    ('Σ MG alım grubu (syn 2/3/4)', 1, lambda c, s: (s == 2) | (s == 3) | (s == 4)),
-    ('Σ MG satış grubu (syn -2/-3/-4)', -1, lambda c, s: (s == -2) | (s == -3) | (s == -4)),
+SIG_DEFS = [  # (ad, beklenen yön, koşul(sb))
+    ('✅ Kurumsal alım A+ (syn 2)', 1, lambda f: f.syn == 2),
+    ('🔵 Güçlü absorpsiyon A+ (syn 3)', 1, lambda f: f.syn == 3),
+    ('🪤 Silkeleme olası (syn 4)', 1, lambda f: f.syn == 4),
+    ('🟢 Güçlü yükseliş (cls 1, tümü)', 1, lambda f: f.cls == 1),
+    ('🔵 Absorpsiyon (cls 10, tümü)', 1, lambda f: f.cls == 10),
+    ('🟡 Hacimsiz yükseliş (cls 3)', -1, lambda f: f.cls == 3),
+    ('❌ Fake yükseliş (syn -4)', -1, lambda f: f.syn == -4),
+    ('🩸 Hisseye özel çıkış A+ (syn -2)', -1, lambda f: f.syn == -2),
+    ('🟠 Güçlü dağıtım A+ (syn -3)', -1, lambda f: f.syn == -3),
+    ('🔴 Güçlü düşüş (cls -1, tümü)', -1, lambda f: f.cls == -1),
+    ('🟠 Dağıtım (cls 11, tümü)', -1, lambda f: f.cls == 11),
+    ('Σ MG alım grubu (syn 2/3/4)', 1, lambda f: f.syn.isin([2, 3, 4])),
+    ('Σ MG satış grubu (syn -2/-3/-4)', -1, lambda f: f.syn.isin([-2, -3, -4])),
+    # --- YÖN MOTORU ---
+    ('🧭 Yön → YUKARI döndü', 1, lambda f: (f.yon == 1) & (f.yon_once != 1)),
+    ('🧭 Yön → AŞAĞI döndü', -1, lambda f: (f.yon == -1) & (f.yon_once != -1)),
+    ('🧭 Yön → YATAY (yukarıdan)', -1, lambda f: (f.yon == 0) & (f.yon_once == 1)),
+    ('🧭 Yön → YATAY (aşağıdan)', 1, lambda f: (f.yon == 0) & (f.yon_once == -1)),
+    ('🧭 Yön YUKARI iken (her mum)', 1, lambda f: f.yon == 1),
+    ('🧭 Yön AŞAĞI iken (her mum)', -1, lambda f: f.yon == -1),
+    ('🧭 Yön YUKARI, 5+ mumdur', 1, lambda f: (f.yon == 1) & (f.yon_yas >= 5)),
+    ('🧭 Yön AŞAĞI, 5+ mumdur', -1, lambda f: (f.yon == -1) & (f.yon_yas >= 5)),
 ]
 
 
@@ -763,9 +815,14 @@ def signal_bars(daily, tf, bench):
         if len(bars) < 60:
             continue
         bc = bclose.reindex(bclose.index.union(bars.index)).ffill().reindex(bars.index).to_numpy()
-        cls, syn, _ = mum_gucu(bars, bc, MG_LOOKN.get(tf, 500))
+        cls, syn, exP_, it = mum_gucu(bars, bc, MG_LOOKN.get(tf, 500), full=True)
+        yon = yon_motoru(exP_, it)
+        yon_once = np.r_[0, yon[:-1]].astype(np.int8)
+        chg = np.r_[True, yon[1:] != yon[:-1]]
+        yas = (np.arange(len(yon)) - np.maximum.accumulate(np.where(chg, np.arange(len(yon)), 0)) + 1)
         c = bars['Close'].to_numpy(float)
-        d = {'ticker': tk, 'date': bars.index, 'cls': cls.astype(np.int8), 'syn': syn.astype(np.int8)}
+        d = {'ticker': tk, 'date': bars.index, 'cls': cls.astype(np.int8), 'syn': syn.astype(np.int8),
+             'yon': yon, 'yon_once': yon_once, 'yon_yas': yas.astype(np.int16)}
         for h in H:
             fwd = np.full(len(c), np.nan)
             fwd[:-h] = (c[h:] / c[:-h] - 1) * 100
@@ -784,11 +841,10 @@ def signal_analysis(sb, tf, rng, reps=300):
     for h in H:
         sb[f'x{h}'] = sb[f'r{h}'] - sb.groupby('date')[f'r{h}'].transform('mean')
     sb['dönem'] = np.where(pd.to_datetime(sb['date']).dt.year < 2000, '<2000', '≥2000')
-    c, s = sb['cls'].to_numpy(), sb['syn'].to_numpy()
     rows, era_rows = [], []
     hm = H[min(2, len(H) - 1)]  # dönem kırılımı için ana vade
     for name, exp, cond in SIG_DEFS:
-        sel = sb[cond(c, s)]
+        sel = sb[cond(sb).to_numpy()]
         if len(sel) < 30:
             continue
         r = dict(sinyal=name, beklenen='↑' if exp == 1 else '↓', n=len(sel))
