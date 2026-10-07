@@ -31,9 +31,10 @@ Kullanım:
 
 Not: Wikipedia S&P 500 listesi BUGÜNKÜ üyelerdir -> survivorship bias.
 """
-__version__ = 'v3 · hedef testi'
+__version__ = 'v4 · rastgele giriş kontrolü'
 
 import argparse
+import zlib
 import os
 import sys
 
@@ -335,6 +336,7 @@ def mg_features(cls, syn, exP, sign, i1, i2, c2):
 
 
 TARGET_EXTS = [1.0, 1.272, 1.618, 2.0, 2.618]
+CTL_DRAWS = 3  # olay başına rastgele kontrol girişi
 
 
 def realized_scale(h, l, c, start, horizon, n, sign, entry, stop, t1, t2):
@@ -389,6 +391,10 @@ def extract_events(df, tf, ticker, p, bench_close=None):
     mg = None
     if bench_close is not None:
         mg = mum_gucu(df, bench_close, MG_LOOKN.get(tf, 500))
+    # rastgele giriş kontrolü için: tam vadesi olan, ATR'si geçerli mumlar
+    crng = np.random.default_rng(zlib.crc32(f'{ticker}|{tf}'.encode()))
+    lo_j = max(p['atr_len'] + 1, 0)
+    hi_j = n - 1 - p['horizon']
     rows = []
     for k in range(len(piv) - 2):
         (i0, p0, t0, _), (i1, p1, _, _), (i2, p2, _, c2) = piv[k], piv[k + 1], piv[k + 2]
@@ -419,6 +425,26 @@ def extract_events(df, tf, ticker, p, bench_close=None):
                                             p0 + sign * e_ * imp)
         row['trd_R_scale'] = realized_scale(h, l, c, c2 + 1, p['horizon'], n, sign, entry, p2,
                                             p0 + sign * 1.272 * imp, p0 + sign * 1.618 * imp)
+        # --- Kontrol: aynı hisse, RASTGELE mum, aynı stop mesafesi (ATR) ve aynı R-katı hedefler ---
+        if risk > 0 and not np.isnan(a[c2]) and hi_j > lo_j:
+            risk_atr = risk / a[c2]
+            rr = {e_: sign * (p0 + sign * e_ * imp - entry) / risk for e_ in TARGET_EXTS}
+            ctl = {e_: [] for e_ in TARGET_EXTS}
+            ctl['scale'] = []
+            for _ in range(CTL_DRAWS):
+                j = int(crng.integers(lo_j, hi_j + 1))
+                if np.isnan(a[j]):
+                    continue
+                en, R1 = c[j], risk_atr * a[j]
+                st = en - sign * R1
+                for e_ in TARGET_EXTS:
+                    ctl[e_].append(realized_R(h, l, c, j + 1, p['horizon'], n, sign, en, st,
+                                              en + sign * rr[e_] * R1))
+                ctl['scale'].append(realized_scale(h, l, c, j + 1, p['horizon'], n, sign, en, st,
+                                                   en + sign * rr[1.272] * R1, en + sign * rr[1.618] * R1))
+            for key, vals in ctl.items():
+                vals = [x for x in vals if not np.isnan(x)]
+                row[f'ctl_R_{key}'] = float(np.mean(vals)) if vals else np.nan
         if mg is not None:
             row.update(mg_features(*mg, sign, i1, i2, c2))
         rows.append(row)
@@ -622,6 +648,31 @@ def target_analysis(ev, rng, reps=300):
                 diffs=pd.DataFrame(diff_rows).round(3))
 
 
+def baseline_analysis(ev, rng, reps=300):
+    """Setup, aynı hissede rastgele girişten (aynı stop/hedef R-katları) daha iyi mi?"""
+    if 'ctl_R_1.272' not in ev.columns:
+        return None
+    e0 = ev[ev['trd_complete'] & (ev['depth'] < 1.0) & (ev['dir'] == 'up')].copy()
+    e0['dönem'] = np.where(pd.to_datetime(e0['date_conf']).dt.year < 2000, '<2000', '≥2000')
+    pairs = [(f'trd_R_{e}', f'ctl_R_{e}', f'Hedef {e}') for e in TARGET_EXTS] + \
+            [('trd_R_scale', 'ctl_R_scale', 'Kademeli 1.272+1.618')]
+    groups = [('Tümü', e0), ('<2000', e0[e0['dönem'] == '<2000']), ('≥2000', e0[e0['dönem'] == '≥2000'])]
+    if 'mg' in e0.columns:
+        groups.append(('MG ≥2 ★A+', e0[e0.mg >= 2]))
+    rows = []
+    for gname, g in groups:
+        for sc, cc, name in pairs:
+            gg = g.dropna(subset=[sc, cc])
+            if len(gg) < 30:
+                continue
+            gg = gg.assign(_d=gg[sc] - gg[cc])
+            d, lo, hi = _boot_mean(gg, '_d', reps, rng)
+            rows.append(dict(grup=gname, hedef=name, n=len(gg), setup_R=gg[sc].mean(), rastgele_R=gg[cc].mean(),
+                             fark=d, GA95=f'[{lo:+.3f}, {hi:+.3f}]',
+                             sonuç='SETUP İYİ' if lo > 0 else ('SETUP KÖTÜ' if hi < 0 else 'fark yok')))
+    return pd.DataFrame(rows).round(3)
+
+
 def mg_analysis(ev, rng, reps=300):
     """Mum Gücü teyidi Fib setup sonucunu iyileştiriyor mu?"""
     if 'mg' not in ev.columns:
@@ -679,6 +730,7 @@ def analyze(ev, rng):
             res['by_dir'][d_] = outcome_table(sub, 'trd')
     res['mg'] = mg_analysis(ev, rng)
     res['targets'] = target_analysis(ev, rng)
+    res['baseline'] = baseline_analysis(ev, rng)
     return res
 
 
@@ -706,6 +758,9 @@ def run(daily, tfs, params, out_dir, rng, write=True, bench=None):
                r['volume'].to_string()]
         for d_, t in r['by_dir'].items():
             sec += [f'\n### Yön: {d_} — işlenebilir', t.to_string()]
+        if r.get('baseline') is not None:
+            sec += ['\n### RASTGELE GİRİŞ KONTROLÜ — yukarı setup vs aynı hissede rastgele giriş',
+                    r['baseline'].to_string(index=False)]
         if r.get('targets'):
             sec += ['\n### HEDEF TESTİ — yukarı setup, ortalama gerçekleşen R', r['targets']['means'].to_string(),
                     '1.272\'ye göre fark (eşleştirilmiş, hisse bazlı bootstrap):', r['targets']['diffs'].to_string(index=False)]

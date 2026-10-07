@@ -154,6 +154,14 @@ def render():
             with st.expander('Sonuç — tanımlayıcı (dipten itibaren, hindsight → iyimser)'):
                 st.dataframe(fmt(r['desc']), width='stretch')
 
+            bl = r.get('baseline')
+            if bl is not None and len(bl):
+                st.subheader('🎲 Rastgele giriş kontrolü')
+                st.caption('Her setup için aynı hissede rastgele 3 mumdan, aynı stop mesafesi (ATR) ve aynı '
+                           'R-katı hedeflerle giriş yapıldı. Survivorship ve piyasa yükselişi iki tarafta da '
+                           'aynı → "fark" Fib setup\'ının zamanlamasının gerçek katkısı.')
+                st.dataframe(bl, hide_index=True, width='stretch')
+
             tg = r.get('targets')
             if tg:
                 st.subheader('🎯 Hedef testi — hangi hedef daha çok R kazandırıyor?')
