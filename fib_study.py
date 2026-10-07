@@ -31,7 +31,7 @@ Kullanım:
 
 Not: Wikipedia S&P 500 listesi BUGÜNKÜ üyelerdir -> survivorship bias.
 """
-__version__ = 'v6.1 · adil kıyas (sadece hazır mumlar)'
+__version__ = 'v7 · sarı mum (Volatility Hole) testi'
 
 import argparse
 import zlib
@@ -802,6 +802,19 @@ SIG_DEFS = [  # (ad, beklenen yön, koşul(sb))
     ('🧭 Yön AŞAĞI iken (her mum)', -1, lambda f: f.yon == -1),
     ('🧭 Yön YUKARI, 5+ mumdur', 1, lambda f: (f.yon == 1) & (f.yon_yas >= 5)),
     ('🧭 Yön AŞAĞI, 5+ mumdur', -1, lambda f: (f.yon == -1) & (f.yon_yas >= 5)),
+    # --- V710 SARI MUM (Volatility Hole) — mevcut tanım ---
+    ('🟨 SARI mum (V710, tümü)', 1, lambda f: f.sq_up | f.sq_dn | f.fx),
+    ('🟨 Sarı: sıkışma + üst 1/3 (volHole_up)', 1, lambda f: f.sq_up),
+    ('🟨 Sarı: sıkışma + alt 1/3 (volHole_dn)', -1, lambda f: f.sq_dn),
+    ('🟨 Sarı: RS füzyon kesişimi', 1, lambda f: f.fx & ~f.sq_up & ~f.sq_dn),
+    ('🟨 Sarı yukarı + HACİMLİ (cls 1/2)', 1, lambda f: f.sq_up & f.cls.isin([1, 2])),
+    ('🟨 Sarı yukarı + HACİMSİZ (cls 3)', -1, lambda f: f.sq_up & (f.cls == 3)),
+    # --- YENİ SARI ADAYLARI (bulgulara göre) ---
+    ('🆕 Kalitesiz yükseliş (cls 3 / syn -4)', -1, lambda f: (f.cls == 3) | (f.syn == -4)),
+    ('🆕 Tepki adayı: sert düşüş + yön aşağı', 1, lambda f: (f.cls == -1) & (f.yon == -1)),
+    ('🆕 Tepki adayı: sert düşüş, yön 5+ mum aşağı', 1, lambda f: f.cls.isin([-1, -2]) & (f.yon == -1) & (f.yon_yas >= 5)),
+    ('🆕 Satıcı yoruldu: hacimsiz düşüş + yön aşağı', 1, lambda f: (f.cls == -3) & (f.yon == -1)),
+    ('🆕 Silkeleme veya hacimsiz düşüş+göreli güç', 1, lambda f: (f.syn == 4) | ((f.cls == -3) & (f.yon != 1))),
 ]
 
 
@@ -813,6 +826,9 @@ PAIRS = [  # (A, B, etiket) → A − B
     ('🟢 Güçlü yükseliş (cls 1, tümü)', '🟡 Hacimsiz yükseliş (cls 3)', 'Hacimli yükseliş − hacimsiz yükseliş'),
     ('🔵 Absorpsiyon (cls 10, tümü)', '🟠 Dağıtım (cls 11, tümü)', 'Absorpsiyon − dağıtım'),
     ('Σ MG alım grubu (syn 2/3/4)', 'Σ MG satış grubu (syn -2/-3/-4)', 'MG alım grubu − satış grubu'),
+    ('🟨 Sarı: sıkışma + üst 1/3 (volHole_up)', '🟨 Sarı: sıkışma + alt 1/3 (volHole_dn)', 'SARI yukarı − SARI aşağı'),
+    ('🟨 Sarı yukarı + HACİMLİ (cls 1/2)', '🟨 Sarı yukarı + HACİMSİZ (cls 3)', 'Sarı yukarı: hacimli − hacimsiz'),
+    ('🆕 Tepki adayı: sert düşüş + yön aşağı', '🆕 Kalitesiz yükseliş (cls 3 / syn -4)', 'Tepki adayı − kalitesiz yükseliş'),
 ]
 
 
@@ -841,6 +857,42 @@ def _pair_diff(sb, ma, mb, col, reps, rng):
     return pt, lo, hi
 
 
+def _ema(x, n):
+    return pd.Series(x).ewm(span=n, adjust=False).mean().to_numpy()
+
+
+def sari_mum(df, bench_close, tf):
+    """ŞAHANE V710 is_yellow_candle birebir: BB(20,2) Keltner(20,1.5) içinde + kapanış KC üst/alt 1/3'ünde,
+    VEYA RS-füzyon hızı sinyalini yukarı kesiyor."""
+    h, l, c = (df[k].to_numpy(float) for k in ['High', 'Low', 'Close'])
+    cs = pd.Series(c)
+    b_mid = cs.rolling(20).mean().to_numpy()
+    b_sd = cs.rolling(20).std(ddof=0).to_numpy()
+    b_up, b_lo = b_mid + 2 * b_sd, b_mid - 2 * b_sd
+    pc = np.r_[np.nan, c[:-1]]
+    tr = np.nanmax(np.vstack([h - l, np.abs(h - pc), np.abs(l - pc)]), axis=0)
+    k_mid = _ema(c, 20)
+    rng_e = _ema(tr, 20)
+    k_up, k_lo = k_mid + 1.5 * rng_e, k_mid - 1.5 * rng_e
+    sq = (b_lo > k_lo) & (b_up < k_up)
+    third = (k_up - k_mid) / 3
+    sq_up = sq & (c >= k_mid + third)
+    sq_dn = sq & (c <= k_mid - third)
+    # RS füzyon
+    b = np.asarray(bench_close, float)
+    rel = c / np.where(b == 0, np.nan, b)
+    scale = pd.Series(c).rolling(200, min_periods=1).mean() / pd.Series(rel).rolling(200, min_periods=1).mean()
+    fC = rel * scale.to_numpy()
+    macd = _ema(np.nan_to_num(fC, nan=np.nanmean(fC)), 12) - _ema(np.nan_to_num(fC, nan=np.nanmean(fC)), 26)
+    L = 24 if tf in ('W', '2W', 'M') else 100
+    mh = pd.Series(macd).rolling(L, min_periods=1).max().to_numpy()
+    ml = pd.Series(macd).rolling(L, min_periods=1).min().to_numpy()
+    spd = (macd - ml) / np.maximum(mh - ml, 0.001) * 100 - 50
+    sig = _ema(spd, 9)
+    fx = (spd > sig) & (np.r_[np.nan, spd[:-1]] <= np.r_[np.nan, sig[:-1]])
+    return sq_up, sq_dn, fx
+
+
 def signal_bars(daily, tf, bench):
     """Her hisse × her mum: cls, syn ve ileri getiriler (giriş = sinyal mumu kapanışı)."""
     H = SIG_HORIZONS.get(tf, [1, 5, 20])
@@ -853,13 +905,15 @@ def signal_bars(daily, tf, bench):
         bc = bclose.reindex(bclose.index.union(bars.index)).ffill().reindex(bars.index).to_numpy()
         cls, syn, exP_, it = mum_gucu(bars, bc, MG_LOOKN.get(tf, 500), full=True)
         yon = yon_motoru(exP_, it)
+        sq_up, sq_dn, fx = sari_mum(bars, bc, tf)
         yon_once = np.r_[0, yon[:-1]].astype(np.int8)
         chg = np.r_[True, yon[1:] != yon[:-1]]
         yas = (np.arange(len(yon)) - np.maximum.accumulate(np.where(chg, np.arange(len(yon)), 0)) + 1)
         c = bars['Close'].to_numpy(float)
         d = {'ticker': tk, 'date': bars.index, 'cls': cls.astype(np.int8), 'syn': syn.astype(np.int8),
              'yon': yon, 'yon_once': yon_once, 'yon_yas': yas.astype(np.int16),
-             'hazir': (it['ready'] & ~np.isnan(exP_))}
+             'hazir': (it['ready'] & ~np.isnan(exP_)),
+             'sq_up': sq_up, 'sq_dn': sq_dn, 'fx': fx}
         for h in H:
             fwd = np.full(len(c), np.nan)
             fwd[:-h] = (c[h:] / c[:-h] - 1) * 100
