@@ -97,6 +97,9 @@ def render():
                     p['min_impulse'] = c2.number_input(f'{tf} min itki (ATR)', 1.0, 20.0,
                                                        p['min_impulse'], 0.5, key=f'mi_{tf}')
                 params[tf] = p
+        do_sig = st.checkbox('🕯️ Mum Gücü sinyal testi (Fib\'den bağımsız)', value=True,
+                             help='Her mumdaki Mum Gücü sinyalinden sonra hisse, aynı tarihteki tüm hisselerden '
+                                  'daha iyi mi gidiyor? Günlük/3G çok uzun sürer; M, 2W, W önerilir.')
         go = st.button('Çalıştır', type='primary', width='stretch',
                        disabled=not (tickers and tfs))
 
@@ -116,6 +119,12 @@ def render():
                 if not ev.empty:
                     results[tf] = (ev, fs.analyze(ev, rng), params[tf])
         st.session_state['res'] = results
+        sig = {}
+        if do_sig and bench is not None:
+            for tf in [t for t in fs.TF_ORDER if t in tfs]:
+                with st.spinner(f'{tf} Mum Gücü sinyal testi…'):
+                    sig[tf] = fs.signal_analysis(fs.signal_bars(data, tf, bench), tf, rng)
+        st.session_state['sig'] = sig
         st.session_state['n_loaded'] = len(data)
 
     results = st.session_state.get('res')
@@ -126,8 +135,24 @@ def render():
 
     st.success(f"{st.session_state.get('n_loaded', 0)} hisse yüklendi.")
     tabs = st.tabs(list(results.keys()))
+    sig_all = st.session_state.get('sig', {})
     for tab, (tf, (ev, r, p)) in zip(tabs, results.items()):
         with tab:
+            sr = sig_all.get(tf)
+            if sr:
+                st.subheader('🕯️ Mum Gücü sinyal testi')
+                st.caption(f"{sr['n_bars']:,} mum. 'fazla %' = sinyalden sonraki getiri − aynı tarihte TÜM hisselerin "
+                           "ortalama getirisi (piyasa ve survivorship etkisi çıkarılmış). GA95 tarih bazlı bootstrap. "
+                           "'isabet' = beklenen yönde fazla getiri oranı. ✓ = beklenen yönde anlamlı, "
+                           "✗ = ters yönde anlamlı, · = fark yok. Çok test var: tek ✓ şans olabilir, "
+                           "M ve W\'de ve iki dönemde tutarlı olmalı.")
+                st.dataframe(sr['table'], hide_index=True, width='stretch')
+                with st.expander('Dönem kırılımı (<2000 / ≥2000)'):
+                    st.dataframe(sr['era'], hide_index=True, width='stretch')
+                st.download_button(f'{tf} sinyal testi sonuçlarını indir (CSV)',
+                                   pd.concat([sr['table'].assign(tablo='ana'), sr['era'].assign(tablo='dönem')]).to_csv(index=False),
+                                   file_name=f'mg_signal_{tf}.csv', mime='text/csv', key=f'sigdl_{tf}')
+                st.divider()
             c = st.columns(4)
             c[0].metric('Olay', r['n'])
             c[1].metric('Yukarı / Aşağı', f"{r['n_up']} / {r['n_down']}")

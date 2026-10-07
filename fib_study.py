@@ -31,7 +31,7 @@ Kullanım:
 
 Not: Wikipedia S&P 500 listesi BUGÜNKÜ üyelerdir -> survivorship bias.
 """
-__version__ = 'v4 · rastgele giriş kontrolü'
+__version__ = 'v5 · Mum Gücü sinyal testi'
 
 import argparse
 import zlib
@@ -594,11 +594,11 @@ def _boot_diff(e, mask, col, reps, rng, strata=None):
     return point, lo, hi
 
 
-def _boot_mean(e, col, reps, rng):
-    """Hisse bazlı küme bootstrap ile ortalama ve %95 GA."""
+def _boot_mean(e, col, reps, rng, cluster='ticker'):
+    """Küme bootstrap (varsayılan hisse bazlı) ile ortalama ve %95 GA."""
     x = e[col].to_numpy(float)
     ok = ~np.isnan(x)
-    uniq, inv = np.unique(e['ticker'].to_numpy(), return_inverse=True)
+    uniq, inv = np.unique(e[cluster].astype(str).to_numpy(), return_inverse=True)
     U = len(uniq)
     s_ = np.bincount(inv, weights=np.where(ok, x, 0), minlength=U)
     k_ = np.bincount(inv, weights=ok.astype(float), minlength=U)
@@ -734,6 +734,89 @@ def analyze(ev, rng):
     return res
 
 
+# ----------------------------------------------------------------------------- Mum Gücü SİNYAL testi (Fib'den bağımsız)
+SIG_HORIZONS = {'M': [1, 3, 6, 12], '2W': [1, 3, 6, 13], 'W': [1, 4, 13, 26], '3D': [1, 5, 20, 60], 'D': [1, 5, 20, 60]}
+SIG_DEFS = [  # (ad, beklenen yön, koşul)
+    ('✅ Kurumsal alım A+ (syn 2)', 1, lambda c, s: s == 2),
+    ('🔵 Güçlü absorpsiyon A+ (syn 3)', 1, lambda c, s: s == 3),
+    ('🪤 Silkeleme olası (syn 4)', 1, lambda c, s: s == 4),
+    ('🟢 Güçlü yükseliş (cls 1, tümü)', 1, lambda c, s: c == 1),
+    ('🔵 Absorpsiyon (cls 10, tümü)', 1, lambda c, s: c == 10),
+    ('🟡 Hacimsiz yükseliş (cls 3)', -1, lambda c, s: c == 3),
+    ('❌ Fake yükseliş (syn -4)', -1, lambda c, s: s == -4),
+    ('🩸 Hisseye özel çıkış A+ (syn -2)', -1, lambda c, s: s == -2),
+    ('🟠 Güçlü dağıtım A+ (syn -3)', -1, lambda c, s: s == -3),
+    ('🔴 Güçlü düşüş (cls -1, tümü)', -1, lambda c, s: c == -1),
+    ('🟠 Dağıtım (cls 11, tümü)', -1, lambda c, s: c == 11),
+    ('Σ MG alım grubu (syn 2/3/4)', 1, lambda c, s: (s == 2) | (s == 3) | (s == 4)),
+    ('Σ MG satış grubu (syn -2/-3/-4)', -1, lambda c, s: (s == -2) | (s == -3) | (s == -4)),
+]
+
+
+def signal_bars(daily, tf, bench):
+    """Her hisse × her mum: cls, syn ve ileri getiriler (giriş = sinyal mumu kapanışı)."""
+    H = SIG_HORIZONS.get(tf, [1, 5, 20])
+    bclose = bench['Close'].astype(float)
+    frames = []
+    for tk, df in daily.items():
+        bars = resample(df, tf)
+        if len(bars) < 60:
+            continue
+        bc = bclose.reindex(bclose.index.union(bars.index)).ffill().reindex(bars.index).to_numpy()
+        cls, syn, _ = mum_gucu(bars, bc, MG_LOOKN.get(tf, 500))
+        c = bars['Close'].to_numpy(float)
+        d = {'ticker': tk, 'date': bars.index, 'cls': cls.astype(np.int8), 'syn': syn.astype(np.int8)}
+        for h in H:
+            fwd = np.full(len(c), np.nan)
+            fwd[:-h] = (c[h:] / c[:-h] - 1) * 100
+            d[f'r{h}'] = fwd.astype(np.float32)
+        frames.append(pd.DataFrame(d))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def signal_analysis(sb, tf, rng, reps=300):
+    """Sinyal sonrası getiri − aynı tarihteki tüm hisselerin ortalaması (kesitsel fazla getiri).
+    Piyasa yönü ve survivorship iki tarafta da aynı → fark = sinyalin bilgisi."""
+    if sb is None or sb.empty:
+        return None
+    H = SIG_HORIZONS.get(tf, [1, 5, 20])
+    sb = sb.copy()
+    for h in H:
+        sb[f'x{h}'] = sb[f'r{h}'] - sb.groupby('date')[f'r{h}'].transform('mean')
+    sb['dönem'] = np.where(pd.to_datetime(sb['date']).dt.year < 2000, '<2000', '≥2000')
+    c, s = sb['cls'].to_numpy(), sb['syn'].to_numpy()
+    rows, era_rows = [], []
+    hm = H[min(2, len(H) - 1)]  # dönem kırılımı için ana vade
+    for name, exp, cond in SIG_DEFS:
+        sel = sb[cond(c, s)]
+        if len(sel) < 30:
+            continue
+        r = dict(sinyal=name, beklenen='↑' if exp == 1 else '↓', n=len(sel))
+        verdicts = []
+        for h in H:
+            e = sel.dropna(subset=[f'x{h}'])
+            if len(e) < 30:
+                continue
+            m, lo, hi = _boot_mean(e, f'x{h}', reps, rng, cluster='date')
+            r[f'+{h} fazla %'] = m
+            r[f'+{h} GA95'] = f'[{lo:+.2f}, {hi:+.2f}]'
+            r[f'+{h} isabet'] = float(((e[f'x{h}'] > 0) if exp == 1 else (e[f'x{h}'] < 0)).mean())
+            sig = lo > 0 or hi < 0
+            verdicts.append('✓' if sig and np.sign(m) == exp else ('✗ ters' if sig else '·'))
+        r['anlamlı (vadeler)'] = ' '.join(verdicts)
+        rows.append(r)
+        for era, eg in sel.groupby('dönem'):
+            e = eg.dropna(subset=[f'x{hm}'])
+            if len(e) < 30:
+                continue
+            m, lo, hi = _boot_mean(e, f'x{hm}', reps, rng, cluster='date')
+            era_rows.append(dict(sinyal=name, dönem=era, n=len(e), vade=f'+{hm}', fazla_getiri_pct=m,
+                                 GA95=f'[{lo:+.2f}, {hi:+.2f}]'))
+    base = {f'+{h} tüm mumlar ort. %': float(sb[f'r{h}'].mean()) for h in H}
+    return dict(table=pd.DataFrame(rows).round(3), era=pd.DataFrame(era_rows).round(3),
+                base=base, n_bars=len(sb), horizons=H)
+
+
 def run(daily, tfs, params, out_dir, rng, write=True, bench=None):
     report = []
     all_ev = []
@@ -819,6 +902,7 @@ def main():
     ap.add_argument('--out', default='fib_out')
     ap.add_argument('--refresh', action='store_true')
     ap.add_argument('--sweep', action='store_true')
+    ap.add_argument('--signals', action='store_true', help='Mum Gücü sinyal testi (Fib\'den bağımsız)')
     ap.add_argument('--synthetic', action='store_true')
     ap.add_argument('--seed', type=int, default=42)
     args = ap.parse_args()
@@ -851,6 +935,16 @@ def main():
             print(f'Endeks ({BENCH}) alınamadı, Mum Gücü testi atlanacak: {ex}', file=sys.stderr)
     print(f'{len(daily)} hisse yüklendi, TF: {tfs}')
 
+    if args.signals:
+        if bench is None:
+            sys.exit('Sinyal testi için endeks verisi gerekli.')
+        for tf in tfs:
+            r = signal_analysis(signal_bars(daily, tf, bench), tf, rng)
+            if r:
+                print(f'\n## {tf} — Mum Gücü sinyal testi ({r["n_bars"]} mum)')
+                print(r['table'].to_string(index=False))
+                print(r['era'].to_string(index=False))
+        return
     if args.sweep:
         sweep(daily, [t for t in tfs if t in ('M', 'W')] or tfs, rng, args.out)
     else:
